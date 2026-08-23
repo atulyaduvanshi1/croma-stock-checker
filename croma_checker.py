@@ -39,8 +39,8 @@ def extract_product_id(url_or_id: str) -> Optional[str]:
 
 def check_stock_via_playwright(product_url: str, pincode: str) -> Tuple[bool, Optional[str], Optional[str], Optional[str]]:
     """
-    Real browser pincode entry verification using Playwright stealth options.
-    Enters the target pincode into Croma's pincode input field and inspects the dynamic React button states.
+    Checks stock for a specific pincode by opening Croma's location modal, submitting the pincode,
+    and strictly verifying if an enabled 'buyNowBtn' button is present in the DOM.
     """
     try:
         from playwright.sync_api import sync_playwright
@@ -80,7 +80,6 @@ def check_stock_via_playwright(product_url: str, pincode: str) -> Tuple[bool, Op
             )
             page = context.new_page()
 
-            # Anti-bot stealth initialization
             page.add_init_script("""
                 Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
                 window.navigator.chrome = { runtime: {} };
@@ -101,22 +100,42 @@ def check_stock_via_playwright(product_url: str, pincode: str) -> Tuple[bool, Op
             title = re.sub(r'\s*-\s*Croma\s*$', '', title, flags=re.IGNORECASE)
             title = re.sub(r'^\s*Buy\s+', '', title, flags=re.IGNORECASE)
 
-            # Fill pincode input if available
-            pincode_input = page.query_selector("input[placeholder*='pincode' i], input[id*='pincode' i], input[name*='pincode' i], input[class*='pincode' i]")
-            if pincode_input:
-                pincode_input.fill(pincode)
-                pincode_input.press("Enter")
-                time.sleep(3)
+            # Step 1: Open Pincode Location Modal
+            pincode_btn = page.query_selector("button.add-pincode-link, .add-pincode-header-prompt, .delivery-location")
+            if pincode_btn:
+                try:
+                    pincode_btn.click(timeout=3000)
+                    time.sleep(1)
+                except Exception:
+                    pass
 
-            # Inspect dynamic React button states
-            cart_btn = page.query_selector("button.pdp-add-to-cart, button[class*='addtocart' i], button:has-text('Add to Cart')")
-            buy_btn = page.query_selector("button[class*='buynow' i], button:has-text('Buy Now')")
+            # Step 2: Fill input.pinElem
+            pin_input = page.query_selector("input.pinElem, input[placeholder*='Enter Pincode' i], input[placeholder*='pincode' i]")
+            if pin_input:
+                pin_input.fill(pincode)
+                time.sleep(1)
 
-            cart_cls = cart_btn.get_attribute("class") if cart_btn else ""
-            buy_cls = buy_btn.get_attribute("class") if buy_btn else ""
+                # Step 3: Click Apply/Continue button
+                apply_btn = page.query_selector("button#apply-pincode-btn, button.sign-in-pincode-continue")
+                if apply_btn:
+                    apply_btn.click()
+                    time.sleep(3)
 
-            cart_disabled = "disable" in (cart_cls or "").lower() or (cart_btn and cart_btn.is_disabled()) if cart_btn else True
-            buy_disabled = "disable" in (buy_cls or "").lower() or (buy_btn and buy_btn.is_disabled()) if buy_btn else True
+            # Step 4: Strict Evaluation -> Check for enabled 'buyNowBtn' button
+            # Target element: <button type="button" class="btn btn-default buyNowBtn">Buy Now</button>
+            buy_now_button = page.query_selector("button.buyNowBtn")
+            
+            is_in_stock = False
+            status_info = "Out of Stock (buyNowBtn not present or disabled)"
+
+            if buy_now_button:
+                btn_class = buy_now_button.get_attribute("class") or ""
+                is_disabled_attr = buy_now_button.is_disabled() or bool(buy_now_button.get_attribute("disabled"))
+                has_disable_class = any(d in btn_class.lower() for d in ["disable", "disabled"])
+
+                if not is_disabled_attr and not has_disable_class:
+                    is_in_stock = True
+                    status_info = "In Stock (Buy Now Enabled)"
 
             # Extract price if visible
             price = None
@@ -129,12 +148,12 @@ def check_stock_via_playwright(product_url: str, pincode: str) -> Tuple[bool, Op
 
             browser.close()
 
-            if not cart_disabled or not buy_disabled:
-                logger.info(f"✅ IN STOCK for pincode {pincode}! (Product: {title})")
-                return True, title, price, "In Stock (Add to Cart Available)"
+            if is_in_stock:
+                logger.info(f"✅ IN STOCK for pincode {pincode}! buyNowBtn present and enabled. (Product: {title})")
+                return True, title, price, status_info
             else:
                 logger.info(f"❌ OUT OF STOCK for pincode {pincode}. (Product: {title})")
-                return False, title, price, "Out of Stock (Buttons Disabled)"
+                return False, title, price, status_info
 
     except Exception as e:
         logger.error(f"Playwright check failed: {e}")
