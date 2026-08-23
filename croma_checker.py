@@ -40,15 +40,21 @@ def extract_product_id(url_or_id: str) -> Optional[str]:
 def check_stock_via_playwright(product_url: str, pincode: str) -> Tuple[bool, Optional[str], Optional[str], Optional[str]]:
     """
     Checks stock for a specific pincode by opening Croma's location modal, submitting the pincode,
-    waiting for React DOM updates to settle, and strictly verifying if an enabled 'buyNowBtn' button is present.
+    validating pincode legitimacy, waiting for React DOM updates, and strictly verifying 'buyNowBtn'.
     """
+    # 1. Format validation for Indian PIN codes (6 digits, starting with 1-8)
+    clean_pin = str(pincode).strip()
+    if not clean_pin or not re.match(r'^[1-8]\d{5}$', clean_pin):
+        logger.warning(f"Invalid PIN code format rejected: {pincode}")
+        return False, None, None, "Invalid Pincode Format"
+
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
         logger.error("Playwright is not installed. Required for dynamic pincode stock checking.")
         return False, None, None, "Playwright not installed"
 
-    logger.info(f"Checking Croma stock for {product_url} at pincode {pincode}...")
+    logger.info(f"Checking Croma stock for {product_url} at pincode {clean_pin}...")
     try:
         with sync_playwright() as p:
             launch_args = [
@@ -111,7 +117,7 @@ def check_stock_via_playwright(product_url: str, pincode: str) -> Tuple[bool, Op
             # Step 2: Fill input.pinElem
             pin_input = page.query_selector("input.pinElem, input[placeholder*='Enter Pincode' i], input[placeholder*='pincode' i]")
             if pin_input:
-                pin_input.fill(pincode)
+                pin_input.fill(clean_pin)
                 time.sleep(1)
 
                 # Step 3: Click Apply/Continue button
@@ -119,10 +125,31 @@ def check_stock_via_playwright(product_url: str, pincode: str) -> Tuple[bool, Op
                 if apply_btn:
                     apply_btn.click()
 
-            # Step 4: CRITICAL WAIT -> Wait 3 seconds for Croma's React API to process the pincode and update DOM button classes!
+            # Step 4: CRITICAL WAIT -> Wait 3 seconds for Croma's React API to process the pincode and update DOM
             time.sleep(3)
 
-            # Step 5: Strict Evaluation -> Check button classes AFTER React updates DOM
+            # Step 5: Check for Croma Modal Error Messages (Invalid Pincode Rejection)
+            page_text_lower = page.content().lower()
+            invalid_keywords = [
+                "please enter valid pincode",
+                "enter valid pincode",
+                "invalid pincode",
+                "pincode not found",
+                "service not available",
+                "pincode is invalid"
+            ]
+            has_pin_error = any(kw in page_text_lower for kw in invalid_keywords)
+
+            # Step 6: Check if modal is still open (rejected pincode)
+            modal_elem = page.query_selector(".select-pincode-container, .MuiDialog-paper")
+            is_modal_open = modal_elem and modal_elem.is_visible()
+
+            if has_pin_error or is_modal_open:
+                logger.warning(f"❌ Pincode {clean_pin} was rejected by Croma (Invalid/Unserviceable PIN).")
+                browser.close()
+                return False, title, None, "Invalid / Rejected Pincode"
+
+            # Step 7: Check button classes AFTER React updates DOM
             buy_now_button = page.query_selector("button[class*='buynow' i], button.buyNowBtn")
             cart_button = page.query_selector("button.pdp-add-to-cart, button[class*='addtocart' i]")
 
@@ -132,8 +159,7 @@ def check_stock_via_playwright(product_url: str, pincode: str) -> Tuple[bool, Op
             buy_disabled = "disable" in buy_cls or (buy_now_button and buy_now_button.is_disabled()) if buy_now_button else True
             cart_disabled = "disable" in cart_cls or (cart_button and cart_button.is_disabled()) if cart_button else True
 
-            content_lower = page.content().lower()
-            has_out_of_stock = any(txt in content_lower for txt in ["currently unavailable", "out of stock", "not deliverable", "item unavailable"])
+            has_out_of_stock = any(txt in page_text_lower for txt in ["currently unavailable", "out of stock", "not deliverable", "item unavailable"])
 
             # Extract price if visible
             price = None
@@ -150,10 +176,10 @@ def check_stock_via_playwright(product_url: str, pincode: str) -> Tuple[bool, Op
             status_info = "In Stock (Buy Now Enabled)" if is_in_stock else "Out of Stock (buyNowBtn not present or disabled)"
 
             if is_in_stock:
-                logger.info(f"✅ IN STOCK for pincode {pincode}! (Product: {title})")
+                logger.info(f"✅ IN STOCK for pincode {clean_pin}! (Product: {title})")
                 return True, title, price, status_info
             else:
-                logger.info(f"❌ OUT OF STOCK for pincode {pincode}. (Product: {title})")
+                logger.info(f"❌ OUT OF STOCK for pincode {clean_pin}. (Product: {title})")
                 return False, title, price, status_info
 
     except Exception as e:
