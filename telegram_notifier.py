@@ -4,30 +4,38 @@ import html
 
 logger = logging.getLogger("croma_checker")
 
-CITY_RANGES = [
-    ("Lucknow", 226001, 226050),
-    ("Mumbai", 400001, 400050),
-    ("Ghaziabad", 201001, 201050),
-    ("Delhi", 110001, 110050),
-    ("Noida", 201301, 201350),
-    ("Gurgaon", 122001, 122050),
-    ("Jodhpur", 342001, 342050),
-    ("Bangalore", 560001, 560050),
-    ("Pune", 411001, 411050),
-    ("Cuttack", 753001, 753050),
-    ("Nashik", 422001, 422050),
-    ("Kolkata", 700001, 700050),
-    ("Chennai", 600001, 600050)
-]
+CITY_MAP = {
+    # Lucknow
+    "226": "Lucknow",
+    # Mumbai
+    "400": "Mumbai",
+    # Delhi
+    "110": "Delhi",
+    # Bangalore
+    "560": "Bangalore",
+    # Noida
+    "2013": "Noida", "2031": "Noida", "2032": "Noida",
+    # Gurgaon
+    "122": "Gurgaon",
+    # Ghaziabad
+    "2010": "Ghaziabad", "2011": "Ghaziabad", "2012": "Ghaziabad", "2451": "Ghaziabad", "2452": "Ghaziabad",
+    # Cuttack
+    "753": "Cuttack", "754": "Cuttack",
+    # Nashik
+    "422": "Nashik",
+    # Pune
+    "411": "Pune", "412": "Pune",
+    # Jodhpur
+    "342": "Jodhpur",
+    # Jaipur
+    "302": "Jaipur", "303": "Jaipur"
+}
 
 def get_city_name(pincode: str) -> str:
-    try:
-        p = int(pincode)
-        for city, start, end in CITY_RANGES:
-            if start <= p <= end:
-                return city
-    except (ValueError, TypeError):
-        pass
+    pin_str = str(pincode).strip()
+    for prefix in ["2013", "2031", "2032", "2010", "2011", "2012", "2451", "2452", "754", "412", "303", "226", "400", "110", "560", "122", "753", "422", "411", "342", "302"]:
+        if pin_str.startswith(prefix):
+            return CITY_MAP.get(prefix, "India")
     return "India"
 
 def send_telegram_message(bot_token: str, chat_id: str, message: str, parse_mode: str = "HTML") -> bool:
