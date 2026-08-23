@@ -329,9 +329,9 @@ def main():
         logger.info("Sending test Telegram message...")
         success = send_telegram_message(bot_token, chat_id, test_msg)
         if success:
-            print("✅ Test message sent successfully! Check your Telegram chat.")
+            print("[SUCCESS] Test message sent successfully! Check your Telegram chat.")
         else:
-            print("❌ Failed to send test message. Check bot_token and chat_id in config.json.")
+            print("[ERROR] Failed to send test message. Make sure you pressed START on your bot in Telegram first.")
         return
 
     run_checker_loop(args.config, run_once=args.once)
