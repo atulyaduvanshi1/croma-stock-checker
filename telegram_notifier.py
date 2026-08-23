@@ -5,18 +5,17 @@ import html
 logger = logging.getLogger("croma_checker")
 
 CITY_RANGES = [
-    ("Bangalore", 560001, 560050),
-    ("Mumbai", 400001, 400050),
-    ("Hyderabad", 500001, 500050),
-    ("Pune", 411001, 411050),
     ("Lucknow", 226001, 226050),
+    ("Mumbai", 400001, 400050),
     ("Ghaziabad", 201001, 201050),
     ("Delhi", 110001, 110050),
-    ("Cuttack", 753001, 753050),
-    ("Nashik", 422001, 422050),
     ("Noida", 201301, 201350),
     ("Gurgaon", 122001, 122050),
     ("Jodhpur", 342001, 342050),
+    ("Bangalore", 560001, 560050),
+    ("Pune", 411001, 411050),
+    ("Cuttack", 753001, 753050),
+    ("Nashik", 422001, 422050),
     ("Kolkata", 700001, 700050),
     ("Chennai", 600001, 600050)
 ]
