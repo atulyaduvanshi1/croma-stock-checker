@@ -40,7 +40,7 @@ def extract_product_id(url_or_id: str) -> Optional[str]:
 def check_stock_via_playwright(product_url: str, pincode: str) -> Tuple[bool, Optional[str], Optional[str], Optional[str]]:
     """
     Checks stock for a specific pincode by opening Croma's location modal, submitting the pincode,
-    and strictly verifying if an enabled 'buyNowBtn' button is present in the DOM.
+    waiting for React DOM updates to settle, and strictly verifying if an enabled 'buyNowBtn' button is present.
     """
     try:
         from playwright.sync_api import sync_playwright
@@ -88,7 +88,6 @@ def check_stock_via_playwright(product_url: str, pincode: str) -> Tuple[bool, Op
             """)
 
             page.goto(product_url, wait_until="domcontentloaded", timeout=30000)
-            time.sleep(2)
 
             title = page.title()
             if "access denied" in title.lower() or "forbidden" in title.lower():
@@ -119,23 +118,22 @@ def check_stock_via_playwright(product_url: str, pincode: str) -> Tuple[bool, Op
                 apply_btn = page.query_selector("button#apply-pincode-btn, button.sign-in-pincode-continue")
                 if apply_btn:
                     apply_btn.click()
-                    time.sleep(3)
 
-            # Step 4: Strict Evaluation -> Check for enabled 'buyNowBtn' button
-            # Target element: <button type="button" class="btn btn-default buyNowBtn">Buy Now</button>
-            buy_now_button = page.query_selector("button.buyNowBtn")
-            
-            is_in_stock = False
-            status_info = "Out of Stock (buyNowBtn not present or disabled)"
+            # Step 4: CRITICAL WAIT -> Wait 3 seconds for Croma's React API to process the pincode and update DOM button classes!
+            time.sleep(3)
 
-            if buy_now_button:
-                btn_class = buy_now_button.get_attribute("class") or ""
-                is_disabled_attr = buy_now_button.is_disabled() or bool(buy_now_button.get_attribute("disabled"))
-                has_disable_class = any(d in btn_class.lower() for d in ["disable", "disabled"])
+            # Step 5: Strict Evaluation -> Check button classes AFTER React updates DOM
+            buy_now_button = page.query_selector("button[class*='buynow' i], button.buyNowBtn")
+            cart_button = page.query_selector("button.pdp-add-to-cart, button[class*='addtocart' i]")
 
-                if not is_disabled_attr and not has_disable_class:
-                    is_in_stock = True
-                    status_info = "In Stock (Buy Now Enabled)"
+            buy_cls = (buy_now_button.get_attribute("class") or "").lower() if buy_now_button else ""
+            cart_cls = (cart_button.get_attribute("class") or "").lower() if cart_button else ""
+
+            buy_disabled = "disable" in buy_cls or (buy_now_button and buy_now_button.is_disabled()) if buy_now_button else True
+            cart_disabled = "disable" in cart_cls or (cart_button and cart_button.is_disabled()) if cart_button else True
+
+            content_lower = page.content().lower()
+            has_out_of_stock = any(txt in content_lower for txt in ["currently unavailable", "out of stock", "not deliverable", "item unavailable"])
 
             # Extract price if visible
             price = None
@@ -148,8 +146,11 @@ def check_stock_via_playwright(product_url: str, pincode: str) -> Tuple[bool, Op
 
             browser.close()
 
+            is_in_stock = (not buy_disabled or not cart_disabled) and not has_out_of_stock
+            status_info = "In Stock (Buy Now Enabled)" if is_in_stock else "Out of Stock (buyNowBtn not present or disabled)"
+
             if is_in_stock:
-                logger.info(f"✅ IN STOCK for pincode {pincode}! buyNowBtn present and enabled. (Product: {title})")
+                logger.info(f"✅ IN STOCK for pincode {pincode}! (Product: {title})")
                 return True, title, price, status_info
             else:
                 logger.info(f"❌ OUT OF STOCK for pincode {pincode}. (Product: {title})")
