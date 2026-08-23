@@ -6,16 +6,7 @@ import argparse
 import logging
 import datetime
 from typing import Dict, Any, Tuple, Optional
-from bs4 import BeautifulSoup
 from telegram_notifier import send_telegram_message, format_stock_alert
-
-# Try importing curl_cffi for TLS fingerprint bypass, fallback to requests
-try:
-    from curl_cffi import requests as http_requests
-    HAS_CURL_CFFI = True
-except ImportError:
-    import requests as http_requests
-    HAS_CURL_CFFI = False
 
 # Setup logging
 logging.basicConfig(
@@ -30,17 +21,12 @@ logger = logging.getLogger("croma_checker")
 
 DEFAULT_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
     "Accept-Language": "en-IN,en-GB;q=0.9,en-US;q=0.8,en;q=0.7",
     "Referer": "https://www.croma.com/",
     "Origin": "https://www.croma.com"
 }
 
 def extract_product_id(url_or_id: str) -> Optional[str]:
-    """
-    Extracts Croma product ID from a URL or raw ID string.
-    Example: https://www.croma.com/apple-iphone-17-256gb-black-/p/317396 -> 317396
-    """
     if not url_or_id:
         return None
     url_or_id = url_or_id.strip()
@@ -51,179 +37,111 @@ def extract_product_id(url_or_id: str) -> Optional[str]:
         return url_or_id
     return None
 
-def check_stock_via_http(product_url: str, pincode: str) -> Tuple[bool, Optional[str], Optional[str], Optional[str]]:
-    """
-    Fetches the Croma product page using curl_cffi (Chrome impersonation) or requests
-    and parses exact button states (disableBuyNow, disableCartBtn, disabled) to evaluate stock.
-    Returns: (is_in_stock, product_title, price, delivery_status_info)
-    """
-    if HAS_CURL_CFFI:
-        session = http_requests.Session(impersonate="chrome120")
-    else:
-        session = http_requests.Session()
-
-    session.headers.update(DEFAULT_HEADERS)
-
-    try:
-        res = session.get(product_url, timeout=15)
-        if res.status_code != 200:
-            logger.warning(f"HTTP request returned status {res.status_code} for {product_url}")
-            return False, None, None, f"HTTP Status {res.status_code}"
-
-        html_text = res.text
-        soup = BeautifulSoup(html_text, "html.parser")
-        title = soup.title.string.strip() if soup.title else "Croma Product"
-
-        # Check for Access Denied / WAF blocking
-        if "access denied" in title.lower() or "forbidden" in title.lower() or "just a moment" in title.lower():
-            logger.warning(f"Access denied by Croma anti-bot protection (Title: '{title}').")
-            return False, title, None, "Access Denied (WAF Blocked)"
-
-        # Clean product title
-        title = re.sub(r'\s*-\s*Croma\s*$', '', title, flags=re.IGNORECASE)
-        title = re.sub(r'^\s*Buy\s+', '', title, flags=re.IGNORECASE)
-
-        # Parse price
-        price = None
-        price_elem = soup.find(class_=lambda c: c and ("amount" in c.lower() or "price" in c.lower() or "pdp-price" in c.lower()))
-        if price_elem:
-            price_text = price_elem.get_text().strip()
-            price_match = re.search(r'₹[\d,]+', price_text)
-            if price_match:
-                price = price_match.group(0)
-
-        # Inspect Cart & Buy Now buttons specifically
-        cart_btn = soup.find("button", class_=lambda c: c and ("pdp-add-to-cart" in c or "addtocart" in c.lower()))
-        buy_btn = soup.find("button", class_=lambda c: c and ("buynow" in c.lower() or "disablebuynow" in c.lower()))
-
-        def is_button_disabled(btn):
-            if not btn:
-                return False
-            classes = btn.get("class", [])
-            if isinstance(classes, str):
-                classes = classes.split()
-            for cls in classes:
-                if any(d in cls.lower() for d in ["disable", "disabled"]):
-                    return True
-            if btn.has_attr("disabled"):
-                return True
-            return False
-
-        # Evaluate button states
-        cart_disabled = is_button_disabled(cart_btn) if cart_btn else True
-        buy_disabled = is_button_disabled(buy_btn) if buy_btn else True
-
-        # Check explicit out of stock text in PDP container
-        page_lower = html_text.lower()
-        has_out_of_stock_text = "out of stock" in page_lower or "currently unavailable" in page_lower or "sold out" in page_lower
-
-        if cart_disabled and buy_disabled:
-            logger.info(f"Product is OUT OF STOCK (Cart & Buy buttons disabled / {title}).")
-            return False, title, price, "Out of Stock (Buttons Disabled)"
-
-        if has_out_of_stock_text:
-            logger.info(f"Product is OUT OF STOCK (Page text indicates out of stock / {title}).")
-            return False, title, price, "Out of Stock"
-
-        if (cart_btn and not cart_disabled) or (buy_btn and not buy_disabled):
-            logger.info(f"Product is IN STOCK! ({title})")
-            return True, title, price, "In Stock (Add to Cart Available)"
-
-        return False, title, price, "Out of Stock / Unknown"
-
-    except Exception as e:
-        logger.error(f"Error fetching product via HTTP: {e}")
-        return False, None, None, f"HTTP Fetch Error: {e}"
-
 def check_stock_via_playwright(product_url: str, pincode: str) -> Tuple[bool, Optional[str], Optional[str], Optional[str]]:
     """
-    Fallback browser check using Playwright with stealth options.
+    Real browser pincode entry verification using Playwright stealth options.
+    Enters the target pincode into Croma's pincode input field and inspects the dynamic React button states.
     """
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
-        logger.warning("Playwright is not installed. Skipping browser fallback.")
+        logger.error("Playwright is not installed. Required for dynamic pincode stock checking.")
         return False, None, None, "Playwright not installed"
 
-    logger.info(f"Running Playwright browser check for {product_url} at pincode {pincode}...")
+    logger.info(f"Checking Croma stock for {product_url} at pincode {pincode}...")
     try:
         with sync_playwright() as p:
-            launch_options = {
-                "headless": True,
-                "args": [
-                    "--disable-blink-features=AutomationControlled",
-                    "--no-sandbox",
-                    "--disable-setuid-sandbox",
-                    "--disable-infobars",
-                    "--window-size=1920,1080",
-                    "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-                ]
-            }
+            launch_args = [
+                "--disable-blink-features=AutomationControlled",
+                "--disable-features=IsolateOrigins,site-per-process",
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-infobars",
+                "--window-position=0,0",
+                "--ignore-certificate-errors",
+                f"--user-agent={DEFAULT_HEADERS['User-Agent']}"
+            ]
             try:
-                browser = p.chromium.launch(channel="chrome", **launch_options)
+                browser = p.chromium.launch(channel="chrome", headless=True, args=launch_args)
             except Exception:
-                browser = p.chromium.launch(**launch_options)
+                browser = p.chromium.launch(headless=True, args=launch_args)
 
             context = browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                user_agent=DEFAULT_HEADERS["User-Agent"],
                 locale="en-IN",
                 timezone_id="Asia/Kolkata",
-                viewport={"width": 1920, "height": 1080}
+                viewport={"width": 1920, "height": 1080},
+                extra_http_headers={
+                    "Accept-Language": "en-IN,en-GB;q=0.9,en-US;q=0.8,en;q=0.7",
+                    "sec-ch-ua": '"Not-A.Brand";v="99", "Chromium";v="124", "Google Chrome";v="124"',
+                    "sec-ch-ua-mobile": "?0",
+                    "sec-ch-ua-platform": '"Windows"'
+                }
             )
             page = context.new_page()
-            page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined}); window.chrome = { runtime: {} };")
+
+            # Anti-bot stealth initialization
+            page.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                window.navigator.chrome = { runtime: {} };
+                Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3]});
+                Object.defineProperty(navigator, 'languages', {get: () => ['en-IN', 'en-US', 'en']});
+            """)
 
             page.goto(product_url, wait_until="domcontentloaded", timeout=30000)
-            time.sleep(3)
+            time.sleep(2)
 
             title = page.title()
             if "access denied" in title.lower() or "forbidden" in title.lower():
+                logger.warning(f"Access denied by Croma anti-bot protection (Title: '{title}').")
                 browser.close()
                 return False, "Access Denied", None, "Anti-bot Blocked"
 
-            # Check for disabled buttons in DOM
-            cart_btn = page.query_selector("button.pdp-add-to-cart, button[class*='addtocart' i]")
-            buy_btn = page.query_selector("button[class*='buynow' i]")
+            # Clean product title
+            title = re.sub(r'\s*-\s*Croma\s*$', '', title, flags=re.IGNORECASE)
+            title = re.sub(r'^\s*Buy\s+', '', title, flags=re.IGNORECASE)
+
+            # Fill pincode input if available
+            pincode_input = page.query_selector("input[placeholder*='pincode' i], input[id*='pincode' i], input[name*='pincode' i], input[class*='pincode' i]")
+            if pincode_input:
+                pincode_input.fill(pincode)
+                pincode_input.press("Enter")
+                time.sleep(3)
+
+            # Inspect dynamic React button states
+            cart_btn = page.query_selector("button.pdp-add-to-cart, button[class*='addtocart' i], button:has-text('Add to Cart')")
+            buy_btn = page.query_selector("button[class*='buynow' i], button:has-text('Buy Now')")
 
             cart_cls = cart_btn.get_attribute("class") if cart_btn else ""
             buy_cls = buy_btn.get_attribute("class") if buy_btn else ""
 
-            is_disabled = (
-                "disable" in (cart_cls or "").lower() or
-                "disable" in (buy_cls or "").lower() or
-                (cart_btn and cart_btn.is_disabled()) or
-                (buy_btn and buy_btn.is_disabled())
-            )
+            cart_disabled = "disable" in (cart_cls or "").lower() or (cart_btn and cart_btn.is_disabled()) if cart_btn else True
+            buy_disabled = "disable" in (buy_cls or "").lower() or (buy_btn and buy_btn.is_disabled()) if buy_btn else True
+
+            # Extract price if visible
+            price = None
+            price_elem = page.query_selector(".pdp-price, .amount, [class*='price' i]")
+            if price_elem:
+                p_text = price_elem.inner_text().strip()
+                p_match = re.search(r'₹[\d,]+', p_text)
+                if p_match:
+                    price = p_match.group(0)
 
             browser.close()
 
-            if is_disabled:
-                return False, title, None, "Out of Stock (Buttons Disabled)"
-            
-            return True, title, None, "In Stock"
+            if not cart_disabled or not buy_disabled:
+                logger.info(f"✅ IN STOCK for pincode {pincode}! (Product: {title})")
+                return True, title, price, "In Stock (Add to Cart Available)"
+            else:
+                logger.info(f"❌ OUT OF STOCK for pincode {pincode}. (Product: {title})")
+                return False, title, price, "Out of Stock (Buttons Disabled)"
+
     except Exception as e:
         logger.error(f"Playwright check failed: {e}")
         return False, None, None, f"Browser error: {e}"
 
-def check_product_pincode(product_url: str, pincode: str, use_playwright_fallback: bool = True) -> Tuple[bool, Optional[str], Optional[str], Optional[str]]:
-    """
-    Master check method combining curl_cffi/HTTP parsing and Playwright fallback.
-    """
-    # Strategy 1: HTTP / TLS fingerprint fetch via curl_cffi
-    in_stock, title, price, delivery_info = check_stock_via_http(product_url, pincode)
-    
-    # If HTTP returned valid status or explicitly confirmed out of stock
-    if in_stock:
-        return True, title, price, delivery_info
-    
-    if delivery_info and "Out of Stock" in delivery_info:
-        return False, title, price, delivery_info
-
-    # Strategy 2: Playwright fallback if HTTP request was blocked
-    if use_playwright_fallback and (not delivery_info or "Blocked" in delivery_info):
-        return check_stock_via_playwright(product_url, pincode)
-
-    return False, title, price, delivery_info or "Out of Stock"
+def check_product_pincode(product_url: str, pincode: str) -> Tuple[bool, Optional[str], Optional[str], Optional[str]]:
+    return check_stock_via_playwright(product_url, pincode)
 
 def load_config(config_path: str) -> Dict[str, Any]:
     if not os.path.exists(config_path):
@@ -235,7 +153,6 @@ def run_checker_loop(config_path: str, run_once: bool = False):
     config = load_config(config_path)
     telegram_cfg = config.get("telegram", {})
     
-    # Priority: Environment variables -> config.json
     bot_token = os.environ.get("TELEGRAM_BOT_TOKEN") or telegram_cfg.get("bot_token")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID") or telegram_cfg.get("chat_id")
     
@@ -243,12 +160,10 @@ def run_checker_loop(config_path: str, run_once: bool = False):
     pincodes = config.get("pincodes", [])
     settings = config.get("settings", {})
 
-    check_interval = settings.get("check_interval_seconds", 60)
-    cooldown_minutes = settings.get("notify_cooldown_minutes", 30)
-    use_playwright = settings.get("use_playwright_fallback", True)
+    check_interval = settings.get("check_interval_seconds", 3600)
+    cooldown_minutes = settings.get("notify_cooldown_minutes", 60)
 
     logger.info(f"Loaded {len(products)} product(s) and {len(pincodes)} pincode(s).")
-    logger.info(f"Checking interval: {check_interval}s | Cooldown: {cooldown_minutes}m")
 
     # Tracking notified state: key = (product_url, pincode), val = timestamp
     notified_state: Dict[Tuple[str, str], float] = {}
@@ -259,8 +174,7 @@ def run_checker_loop(config_path: str, run_once: bool = False):
 
         for product_url in products:
             for pincode in pincodes:
-                logger.info(f"Checking product: {product_url} | Pincode: {pincode}")
-                in_stock, title, price, delivery_info = check_product_pincode(product_url, pincode, use_playwright)
+                in_stock, title, price, delivery_info = check_product_pincode(product_url, pincode)
 
                 state_key = (product_url, pincode)
                 last_notified = notified_state.get(state_key, 0)
@@ -282,8 +196,8 @@ def run_checker_loop(config_path: str, run_once: bool = False):
                         
                         # 2. Send WhatsApp Alert
                         try:
-                            from whatsapp_notifier import send_whatsapp_alert, format_whatsapp_stock_alert, CITY_PINCODE_MAP
-                            city_name = CITY_PINCODE_MAP.get(str(pincode), "India")
+                            from whatsapp_notifier import send_whatsapp_alert, format_whatsapp_stock_alert, get_city_name
+                            city_name = get_city_name(pincode)
                             wa_msg = format_whatsapp_stock_alert(
                                 product_title=title or "Croma Product",
                                 product_url=product_url,
