@@ -4,14 +4,6 @@
     "bot_token": "8824376005:AAFstEua-MzOxy8GzEED8CR_fstnGrcIEWQ",
     "chat_id": "-5394925179"
   },
-  "whatsapp": {
-    "enabled": true,
-    "provider": "callmebot",
-    "phone_number": "+919795001270",
-    "callmebot_apikey": "YOUR_CALLMEBOT_API_KEY",
-    "twilio_account_sid": "",
-    "twilio_auth_token": ""
-  },
   "pincodes": [
     "226001",
     "226002",

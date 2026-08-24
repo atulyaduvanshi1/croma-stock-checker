@@ -230,7 +230,7 @@ def run_checker_loop(config_path: str, run_once: bool = False):
                     logger.info(f"✅ IN STOCK! Product: {title or product_url} | Pincode: {pincode} | Price: {price}")
                     
                     if (time.time() - last_notified) > cooldown_seconds:
-                        # 1. Send Telegram Alert
+                        # Send Telegram Alert
                         alert_msg = format_stock_alert(
                             product_title=title or "Croma Product",
                             product_url=product_url,
@@ -239,23 +239,6 @@ def run_checker_loop(config_path: str, run_once: bool = False):
                             delivery_info=delivery_info
                         )
                         sent_tg = send_telegram_message(bot_token, chat_id, alert_msg)
-                        
-                        # 2. Send WhatsApp Alert
-                        try:
-                            from whatsapp_notifier import send_whatsapp_alert, format_whatsapp_stock_alert, get_city_name
-                            city_name = get_city_name(pincode)
-                            wa_msg = format_whatsapp_stock_alert(
-                                product_title=title or "Croma Product",
-                                product_url=product_url,
-                                pincode=pincode,
-                                price=price,
-                                delivery_info=delivery_info,
-                                city_name=city_name
-                            )
-                            send_whatsapp_alert(config, wa_msg)
-                        except Exception as wa_err:
-                            logger.error(f"WhatsApp notification error: {wa_err}")
-
                         if sent_tg:
                             notified_state[state_key] = time.time()
                     else:
