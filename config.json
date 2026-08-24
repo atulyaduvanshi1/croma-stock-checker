@@ -379,7 +379,7 @@
     "https://www.croma.com/apple-iphone-17-256gb-sage-/p/317403"
   ],
   "settings": {
-    "check_interval_seconds": 3600,
+    "check_interval_seconds": 7200,
     "notify_cooldown_minutes": 60,
     "use_playwright_fallback": true
   }

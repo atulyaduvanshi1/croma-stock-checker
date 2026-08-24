@@ -2,8 +2,8 @@ name: Croma Stock Checker
 
 on:
   schedule:
-    # Runs at minute 0 of every hour (24 times a day)
-    - cron: '0 * * * *'
+    # Runs at minute 0 of every 2nd hour (12 times a day)
+    - cron: '0 */2 * * *'
   workflow_dispatch:
     # Allows manual trigger from the GitHub Actions tab
 
