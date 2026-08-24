@@ -19,14 +19,16 @@ from telegram_notifier import send_telegram_message, format_stock_alert
 # Cap concurrent Playwright fallbacks independently of API check concurrency.
 PLAYWRIGHT_FALLBACK_SEMAPHORE = threading.Semaphore(2)
 
-# Setup logging
+# Setup logging. Console stays at INFO for readability; the log file also
+# captures DEBUG (raw API response bodies) for troubleshooting stock decisions.
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)
+file_handler = logging.FileHandler("croma_checker.log", encoding="utf-8")
+file_handler.setLevel(logging.DEBUG)
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler("croma_checker.log", encoding="utf-8")
-    ]
+    handlers=[console_handler, file_handler]
 )
 logger = logging.getLogger("croma_checker")
 
@@ -135,7 +137,10 @@ def check_stock_via_api(product_url: str, pincode: str) -> Tuple[bool, Optional[
                 time.sleep(0.5 * (attempt + 1))
 
         if resp is None or resp.status_code != 200:
+            logger.debug(f"OMS API non-200 body for product {product_id} @ {clean_pin}: {resp.text if resp else '<no response>'}")
             raise RuntimeError(f"OMS API returned status {last_status}")
+
+        logger.debug(f"OMS API response for product {product_id} @ {clean_pin}: {resp.text}")
 
         data = resp.json()
         unavailable = (
