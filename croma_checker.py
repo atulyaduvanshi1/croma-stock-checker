@@ -66,6 +66,29 @@ def extract_product_id(url_or_id: str) -> Optional[str]:
     return None
 
 def build_oms_payload(product_id: str, pincode: str) -> Dict[str, Any]:
+    # Mirrors the exact request Croma's own PDP sends: one promiseLine per
+    # fulfillment type (home delivery, store pickup, same-day delivery). A
+    # product can be unavailable via HDEL but still available via SDEL/STOR,
+    # so all three must be asked about together to match what "Buy Now" on
+    # the actual page reflects.
+    def line(fulfillment_type: str, line_id: str, req_end_date: str = "") -> Dict[str, Any]:
+        return {
+            "fulfillmentType": fulfillment_type,
+            "mch": "",
+            "itemID": product_id,
+            "lineId": line_id,
+            "categoryType": "mobile",
+            "reqEndDate": req_end_date,
+            "reqStartDate": "",
+            "requiredQty": "1",
+            "shipToAddress": {
+                "company": "", "country": "", "city": "", "mobilePhone": "",
+                "state": "", "zipCode": pincode,
+                "extn": {"irlAddressLine1": "", "irlAddressLine2": ""}
+            },
+            "extn": {"widerStoreFlag": "N"}
+        }
+
     return {
         "promise": {
             "allocationRuleID": "SYSTEM",
@@ -74,22 +97,9 @@ def build_oms_payload(product_id: str, pincode: str) -> Dict[str, Any]:
             "sourcingClassification": "EC",
             "promiseLines": {
                 "promiseLine": [
-                    {
-                        "fulfillmentType": "HDEL",
-                        "mch": "",
-                        "itemID": product_id,
-                        "lineId": "1",
-                        "categoryType": "mobile",
-                        "reqEndDate": "2500-01-01",
-                        "reqStartDate": "",
-                        "requiredQty": "1",
-                        "shipToAddress": {
-                            "company": "", "country": "", "city": "", "mobilePhone": "",
-                            "state": "", "zipCode": pincode,
-                            "extn": {"irlAddressLine1": "", "irlAddressLine2": ""}
-                        },
-                        "extn": {"widerStoreFlag": "N"}
-                    }
+                    line("HDEL", "1", req_end_date="2500-01-01"),
+                    line("STOR", "2"),
+                    line("SDEL", "3"),
                 ]
             }
         }
@@ -143,16 +153,22 @@ def check_stock_via_api(product_url: str, pincode: str) -> Tuple[bool, Optional[
         logger.debug(f"OMS API response for product {product_id} @ {clean_pin}: {resp.text}")
 
         data = resp.json()
-        unavailable = (
-            data.get("promise", {})
-            .get("suggestedOption", {})
-            .get("unavailableLines", {})
-            .get("unavailableLine", [])
-        )
-        is_in_stock = len(unavailable) == 0
+        suggested_option = data.get("promise", {}).get("suggestedOption", {})
+        available = suggested_option.get("option", {}).get("promiseLines", {}).get("promiseLine", [])
+        unavailable = suggested_option.get("unavailableLines", {}).get("unavailableLine", [])
 
-        status_info = "In Stock (deliverable to pincode)" if is_in_stock else \
-            f"Out of Stock ({unavailable[0].get('unavailableReason', 'unavailable')})"
+        # A product can be unavailable via one fulfillment type (e.g. home
+        # delivery) but still purchasable via another (e.g. same-day delivery
+        # or store pickup) — it's in stock if ANY line came back fulfillable,
+        # matching what "Buy Now" reflects on the actual product page.
+        is_in_stock = len(available) > 0
+
+        if is_in_stock:
+            fulfillment = available[0].get("fulfillmentType", "unknown")
+            status_info = f"In Stock (deliverable to pincode via {fulfillment})"
+        else:
+            reason = unavailable[0].get("unavailableReason", "unavailable") if unavailable else "unavailable"
+            status_info = f"Out of Stock ({reason})"
 
         logger.info(
             f"{'✅ IN STOCK' if is_in_stock else '❌ OUT OF STOCK'} for pincode {clean_pin} "
