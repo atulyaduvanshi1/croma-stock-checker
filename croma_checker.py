@@ -2,11 +2,22 @@ import os
 import re
 import time
 import json
+import html as html_module
 import argparse
 import logging
 import datetime
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, Any, Tuple, Optional
+from curl_cffi import requests as curl_requests
 from telegram_notifier import send_telegram_message, format_stock_alert
+
+# Playwright fallback launches a full browser per call, which is heavy (CPU/memory)
+# and adds to the load hitting Croma's site. Under the same thread pool that runs
+# the fast API checks, a burst of API 403s can trigger many browsers at once,
+# which both starves the machine and makes the underlying rate-limiting worse.
+# Cap concurrent Playwright fallbacks independently of API check concurrency.
+PLAYWRIGHT_FALLBACK_SEMAPHORE = threading.Semaphore(2)
 
 # Setup logging
 logging.basicConfig(
@@ -26,6 +37,21 @@ DEFAULT_HEADERS = {
     "Origin": "https://www.croma.com"
 }
 
+# Croma's PWA API. Discovered by inspecting the network traffic that Croma's own
+# site fires when a user submits a pincode on a product page. Requires TLS/HTTP2
+# fingerprints that resemble a real browser (plain `requests` gets a 403 from
+# Akamai), which is why calls below go through curl_cffi's `impersonate="chrome124"`.
+API_BASE = "https://api.croma.com"
+OMS_SUBSCRIPTION_KEY = "1131858141634e2abe2efb2b3a2a2a5d"
+API_HEADERS = {
+    "accept": "application/json, text/plain, */*",
+    "accept-language": "en-IN,en-GB;q=0.9,en-US;q=0.8,en;q=0.7",
+    "content-type": "application/json",
+    "origin": "https://www.croma.com",
+    "referer": "https://www.croma.com/",
+    "user-agent": DEFAULT_HEADERS["User-Agent"],
+}
+
 def extract_product_id(url_or_id: str) -> Optional[str]:
     if not url_or_id:
         return None
@@ -36,6 +62,102 @@ def extract_product_id(url_or_id: str) -> Optional[str]:
     if url_or_id.isdigit():
         return url_or_id
     return None
+
+def build_oms_payload(product_id: str, pincode: str) -> Dict[str, Any]:
+    return {
+        "promise": {
+            "allocationRuleID": "SYSTEM",
+            "checkInventory": "Y",
+            "organizationCode": "CROMA",
+            "sourcingClassification": "EC",
+            "promiseLines": {
+                "promiseLine": [
+                    {
+                        "fulfillmentType": "HDEL",
+                        "mch": "",
+                        "itemID": product_id,
+                        "lineId": "1",
+                        "categoryType": "mobile",
+                        "reqEndDate": "2500-01-01",
+                        "reqStartDate": "",
+                        "requiredQty": "1",
+                        "shipToAddress": {
+                            "company": "", "country": "", "city": "", "mobilePhone": "",
+                            "state": "", "zipCode": pincode,
+                            "extn": {"irlAddressLine1": "", "irlAddressLine2": ""}
+                        },
+                        "extn": {"widerStoreFlag": "N"}
+                    }
+                ]
+            }
+        }
+    }
+
+def check_stock_via_api(product_url: str, pincode: str) -> Tuple[bool, Optional[str], Optional[str], Optional[str]]:
+    """
+    Fast path: calls Croma's own PWA APIs directly instead of driving a browser.
+    - GET .../pdp/deliveryoption/ tells us whether the product is generally sellable.
+    - POST .../inventory/oms/v2/tms/details-pwa/ is the real per-pincode delivery
+      promise check; an empty "unavailableLines" list means it can be fulfilled there.
+    """
+    clean_pin = str(pincode).strip()
+    if not clean_pin or not re.match(r'^[1-8]\d{5}$', clean_pin):
+        logger.warning(f"Invalid PIN code format rejected: {pincode}")
+        return False, None, None, "Invalid Pincode Format"
+
+    product_id = extract_product_id(product_url)
+    if not product_id:
+        logger.error(f"Could not extract product ID from URL: {product_url}")
+        return False, None, None, "Invalid Product URL"
+
+    try:
+        oms_headers = dict(API_HEADERS)
+        oms_headers["oms-apim-subscription-key"] = OMS_SUBSCRIPTION_KEY
+        payload = build_oms_payload(product_id, clean_pin)
+
+        # Akamai occasionally 403s the API under high concurrency (rate-limiting,
+        # not a hard block) — retry a couple times with backoff before giving up
+        # on the fast path and paying for a full Playwright browser fallback.
+        resp = None
+        last_status = None
+        for attempt in range(3):
+            resp = curl_requests.post(
+                f"{API_BASE}/inventory/oms/v2/tms/details-pwa/",
+                headers=oms_headers,
+                json=payload,
+                impersonate="chrome124",
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                break
+            last_status = resp.status_code
+            if attempt < 2:
+                time.sleep(0.5 * (attempt + 1))
+
+        if resp is None or resp.status_code != 200:
+            raise RuntimeError(f"OMS API returned status {last_status}")
+
+        data = resp.json()
+        unavailable = (
+            data.get("promise", {})
+            .get("suggestedOption", {})
+            .get("unavailableLines", {})
+            .get("unavailableLine", [])
+        )
+        is_in_stock = len(unavailable) == 0
+
+        status_info = "In Stock (deliverable to pincode)" if is_in_stock else \
+            f"Out of Stock ({unavailable[0].get('unavailableReason', 'unavailable')})"
+
+        logger.info(
+            f"{'✅ IN STOCK' if is_in_stock else '❌ OUT OF STOCK'} for pincode {clean_pin} "
+            f"(Product ID: {product_id})"
+        )
+        return is_in_stock, None, None, status_info
+
+    except Exception as e:
+        logger.warning(f"API check failed for {product_url} @ {clean_pin}: {e}")
+        raise
 
 def check_stock_via_playwright(product_url: str, pincode: str) -> Tuple[bool, Optional[str], Optional[str], Optional[str]]:
     """
@@ -186,8 +308,30 @@ def check_stock_via_playwright(product_url: str, pincode: str) -> Tuple[bool, Op
         logger.error(f"Playwright check failed: {e}")
         return False, None, None, f"Browser error: {e}"
 
-def check_product_pincode(product_url: str, pincode: str) -> Tuple[bool, Optional[str], Optional[str], Optional[str]]:
-    return check_stock_via_playwright(product_url, pincode)
+def fetch_product_title(product_url: str) -> Optional[str]:
+    """Best-effort product title lookup via a plain page fetch (used only for Telegram alert text)."""
+    try:
+        resp = curl_requests.get(product_url, headers=API_HEADERS, impersonate="chrome124", timeout=10)
+        match = re.search(r"<title>(.*?)</title>", resp.text, re.IGNORECASE | re.DOTALL)
+        if not match:
+            return None
+        title = html_module.unescape(match.group(1).strip())
+        title = re.sub(r'\s*-\s*Croma\s*$', '', title, flags=re.IGNORECASE)
+        title = re.sub(r'^\s*Buy\s+', '', title, flags=re.IGNORECASE)
+        return title
+    except Exception as e:
+        logger.warning(f"Could not fetch product title for {product_url}: {e}")
+        return None
+
+def check_product_pincode(product_url: str, pincode: str, use_playwright_fallback: bool = True) -> Tuple[bool, Optional[str], Optional[str], Optional[str]]:
+    try:
+        return check_stock_via_api(product_url, pincode)
+    except Exception:
+        if not use_playwright_fallback:
+            return False, None, None, "API check failed"
+        logger.info(f"Falling back to Playwright for {product_url} @ {pincode}...")
+        with PLAYWRIGHT_FALLBACK_SEMAPHORE:
+            return check_stock_via_playwright(product_url, pincode)
 
 def load_config(config_path: str) -> Dict[str, Any]:
     if not os.path.exists(config_path):
@@ -208,6 +352,8 @@ def run_checker_loop(config_path: str, run_once: bool = False):
 
     check_interval = settings.get("check_interval_seconds", 3600)
     cooldown_minutes = settings.get("notify_cooldown_minutes", 60)
+    max_workers = settings.get("max_concurrent_checks", 20)
+    use_playwright_fallback = settings.get("use_playwright_fallback", True)
 
     logger.info(f"Loaded {len(products)} product(s) and {len(pincodes)} pincode(s).")
 
@@ -218,19 +364,33 @@ def run_checker_loop(config_path: str, run_once: bool = False):
         iteration_start = time.time()
         logger.info(f"--- Starting Stock Checking Pass ({datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}) ---")
 
-        for pincode in pincodes:
-            for product_url in products:
-                in_stock, title, price, delivery_info = check_product_pincode(product_url, pincode)
+        product_titles = {url: fetch_product_title(url) for url in products}
 
+        tasks = [(product_url, pincode) for pincode in pincodes for product_url in products]
+        cooldown_seconds = cooldown_minutes * 60
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_task = {
+                executor.submit(check_product_pincode, product_url, pincode, use_playwright_fallback): (product_url, pincode)
+                for product_url, pincode in tasks
+            }
+
+            for future in as_completed(future_to_task):
+                product_url, pincode = future_to_task[future]
+                try:
+                    in_stock, title, price, delivery_info = future.result()
+                except Exception as e:
+                    logger.error(f"Check failed for {product_url} @ {pincode}: {e}")
+                    continue
+
+                title = title or product_titles.get(product_url)
                 state_key = (product_url, pincode)
                 last_notified = notified_state.get(state_key, 0)
-                cooldown_seconds = cooldown_minutes * 60
 
                 if in_stock:
                     logger.info(f"✅ IN STOCK! Product: {title or product_url} | Pincode: {pincode} | Price: {price}")
-                    
+
                     if (time.time() - last_notified) > cooldown_seconds:
-                        # Send Telegram Alert
                         alert_msg = format_stock_alert(
                             product_title=title or "Croma Product",
                             product_url=product_url,
