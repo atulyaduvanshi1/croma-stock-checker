@@ -218,8 +218,8 @@ def run_checker_loop(config_path: str, run_once: bool = False):
         iteration_start = time.time()
         logger.info(f"--- Starting Stock Checking Pass ({datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}) ---")
 
-        for product_url in products:
-            for pincode in pincodes:
+        for pincode in pincodes:
+            for product_url in products:
                 in_stock, title, price, delivery_info = check_product_pincode(product_url, pincode)
 
                 state_key = (product_url, pincode)
@@ -244,7 +244,7 @@ def run_checker_loop(config_path: str, run_once: bool = False):
                     else:
                         logger.info(f"Skipping alert for {state_key} (cooldown active).")
                 else:
-                    logger.info(f"❌ OUT OF STOCK / Unavailable for pincode {pincode}. Reason: {delivery_info}")
+                    logger.info(f"❌ OUT OF STOCK / Unavailable for product {product_url} at pincode {pincode}. Reason: {delivery_info}")
 
         if run_once:
             logger.info("Single pass complete (--once flag passed). Exiting.")
