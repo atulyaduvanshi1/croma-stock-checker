@@ -346,7 +346,7 @@ def fetch_product_title(product_url: str) -> Optional[str]:
 
 def check_product_pincode(product_url: str, pincode: str, use_playwright_fallback: bool = True) -> Tuple[bool, Optional[str], Optional[str], Optional[str]]:
     try:
-        return check_stock_via_api(product_url, pincode)
+        in_stock, title, price, delivery_info = check_stock_via_api(product_url, pincode)
     except Exception:
         if not use_playwright_fallback:
             return False, None, None, "API check failed"
@@ -354,13 +354,38 @@ def check_product_pincode(product_url: str, pincode: str, use_playwright_fallbac
         with PLAYWRIGHT_FALLBACK_SEMAPHORE:
             return check_stock_via_playwright(product_url, pincode)
 
+    if not in_stock:
+        return in_stock, title, price, delivery_info
+
+    # Croma's API occasionally returns a stale/bad "available" response for a
+    # product (observed: one product showing in-stock at every pincode in a
+    # single pass, then correctly out-of-stock moments later on retest). A
+    # single "in stock" hit isn't trustworthy enough to alert on by itself, so
+    # re-query once more before treating it as real — cheap since it only
+    # runs for positive hits, not the whole sweep.
+    time.sleep(1.5)
+    try:
+        confirm_in_stock, _, _, confirm_info = check_stock_via_api(product_url, pincode)
+    except Exception as e:
+        logger.warning(f"Confirmation check failed for {product_url} @ {pincode}: {e}")
+        return False, title, price, "Unconfirmed (confirmation check errored)"
+
+    if not confirm_in_stock:
+        logger.warning(
+            f"Discarding likely false positive: {product_url} @ {pincode} was IN STOCK "
+            f"on first check but OUT OF STOCK on confirmation ({confirm_info})."
+        )
+        return False, title, price, "Unconfirmed (failed second check)"
+
+    return in_stock, title, price, delivery_info
+
 def load_config(config_path: str) -> Dict[str, Any]:
     if not os.path.exists(config_path):
         raise FileNotFoundError(f"Configuration file not found at {config_path}")
     with open(config_path, "r", encoding="utf-8") as f:
         return json.load(f)
 
-def run_checker_loop(config_path: str, run_once: bool = False):
+def run_checker_loop(config_path: str, run_once: bool = False, dry_run: bool = False):
     config = load_config(config_path)
     telegram_cfg = config.get("telegram", {})
     
@@ -417,7 +442,10 @@ def run_checker_loop(config_path: str, run_once: bool = False):
 
         if city_hits:
             alert_msg = format_grouped_stock_alert(city_hits)
-            send_telegram_message(bot_token, chat_id, alert_msg)
+            if dry_run:
+                logger.info(f"[DRY RUN] Would send Telegram alert:\n{alert_msg}")
+            else:
+                send_telegram_message(bot_token, chat_id, alert_msg)
         else:
             logger.info("No stock found this pass; no alert sent.")
 
@@ -434,6 +462,7 @@ def main():
     parser = argparse.ArgumentParser(description="Croma Stock & Pincode Availability Checker")
     parser.add_argument("--config", default="config.json", help="Path to config.json file")
     parser.add_argument("--once", action="store_true", help="Run a single check pass and exit")
+    parser.add_argument("--dry-run", action="store_true", help="Run checks and log the alert that would be sent, without contacting Telegram")
     parser.add_argument("--test-telegram", action="store_true", help="Send a test message to verify Telegram bot setup")
 
     args = parser.parse_args()
@@ -452,7 +481,7 @@ def main():
             print("[ERROR] Failed to send test message. Make sure you pressed START on your bot in Telegram first.")
         return
 
-    run_checker_loop(args.config, run_once=args.once)
+    run_checker_loop(args.config, run_once=args.once, dry_run=args.dry_run)
 
 if __name__ == "__main__":
     main()
