@@ -65,7 +65,6 @@ Edit `config.json` in the project directory:
   ],
   "settings": {
     "check_interval_seconds": 60,
-    "notify_cooldown_minutes": 30,
     "use_playwright_fallback": true
   }
 }
@@ -74,7 +73,8 @@ Edit `config.json` in the project directory:
 - **`products`**: Add as many Croma product URLs or variant links as you want.
 - **`pincodes`**: Add all pincodes you want to check for delivery stock.
 - **`check_interval_seconds`**: Frequency of checking cycle (in seconds).
-- **`notify_cooldown_minutes`**: Cooldown time before re-alerting for an item that stays in stock.
+
+Each pass sends at most **one** Telegram message, summarizing every city/product/pincode combination found in stock during that pass (grouped as "City → Product → Pincodes"). This avoids a burst of near-duplicate messages when a whole city has stock at once.
 
 ---
 

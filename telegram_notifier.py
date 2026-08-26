@@ -1,6 +1,7 @@
 import requests
 import logging
 import html
+from typing import Dict, Any
 
 logger = logging.getLogger("croma_checker")
 
@@ -71,24 +72,29 @@ def send_telegram_message(bot_token: str, chat_id: str, message: str, parse_mode
         logger.error(f"Error sending Telegram message: {e}")
         return False
 
-def format_stock_alert(product_title: str, product_url: str, pincode: str, price: str = None, delivery_info: str = None) -> str:
+def format_grouped_stock_alert(city_hits: Dict[str, Dict[str, Dict[str, Any]]]) -> str:
     """
-    Formats a clean HTML alert message for Telegram with City name mapping.
-    """
-    safe_title = html.escape(product_title or "Croma Product")
-    safe_pincode = html.escape(str(pincode))
-    safe_city = html.escape(get_city_name(pincode))
-    safe_price = html.escape(str(price)) if price else "N/A"
-    safe_delivery = html.escape(str(delivery_info)) if delivery_info else "In Stock / Available for delivery"
-    safe_url = html.escape(product_url)
+    Builds a single consolidated HTML alert for an entire check pass, grouped
+    by city then by product, listing every pincode where that product is in
+    stock. This replaces sending one message per (product, pincode) hit, which
+    turned into back-to-back spam whenever a whole city had stock at once.
 
-    msg = (
-        f"🚨 <b>CROMA STOCK ALERT!</b> 🚨\n\n"
-        f"📱 <b>Product:</b> {safe_title}\n"
-        f"🏙 <b>City:</b> {safe_city}\n"
-        f"📍 <b>Pincode:</b> <code>{safe_pincode}</code>\n"
-        f"💰 <b>Price:</b> {safe_price}\n"
-        f"🚚 <b>Status:</b> {safe_delivery}\n\n"
-        f"🔗 <a href=\"{safe_url}\">Click Here to Buy Now on Croma</a>"
-    )
-    return msg
+    city_hits shape: { city_name: { product_title: {"pins": [pincode, ...], "url": product_url} } }
+    """
+    lines = ["🚨 <b>CROMA STOCK ALERT!</b> 🚨"]
+
+    for city in sorted(city_hits.keys()):
+        products = city_hits[city]
+        lines.append(f"\n🏙 <b>{html.escape(city)}</b>")
+        for product_title in sorted(products.keys()):
+            info = products[product_title]
+            safe_title = html.escape(product_title or "Croma Product")
+            safe_url = html.escape(info.get("url", ""))
+            pins = sorted(set(info.get("pins", [])))
+            safe_pins = ", ".join(html.escape(str(p)) for p in pins)
+            lines.append(
+                f"📱 <a href=\"{safe_url}\">{safe_title}</a>\n"
+                f"📍 Pincodes: <code>{safe_pins}</code>"
+            )
+
+    return "\n".join(lines)

@@ -10,7 +10,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, Any, Tuple, Optional
 from curl_cffi import requests as curl_requests
-from telegram_notifier import send_telegram_message, format_stock_alert
+from telegram_notifier import send_telegram_message, format_grouped_stock_alert, get_city_name
 
 # Playwright fallback launches a full browser per call, which is heavy (CPU/memory)
 # and adds to the load hitting Croma's site. Under the same thread pool that runs
@@ -372,14 +372,10 @@ def run_checker_loop(config_path: str, run_once: bool = False):
     settings = config.get("settings", {})
 
     check_interval = settings.get("check_interval_seconds", 3600)
-    cooldown_minutes = settings.get("notify_cooldown_minutes", 60)
     max_workers = settings.get("max_concurrent_checks", 20)
     use_playwright_fallback = settings.get("use_playwright_fallback", True)
 
     logger.info(f"Loaded {len(products)} product(s) and {len(pincodes)} pincode(s).")
-
-    # Tracking notified state: key = (product_url, pincode), val = timestamp
-    notified_state: Dict[Tuple[str, str], float] = {}
 
     while True:
         iteration_start = time.time()
@@ -388,7 +384,12 @@ def run_checker_loop(config_path: str, run_once: bool = False):
         product_titles = {url: fetch_product_title(url) for url in products}
 
         tasks = [(product_url, pincode) for pincode in pincodes for product_url in products]
-        cooldown_seconds = cooldown_minutes * 60
+
+        # Collect every in-stock hit from this pass instead of alerting per hit,
+        # then send ONE consolidated Telegram message at the end. Alerting per
+        # (product, pincode) meant a whole city having stock fired a burst of
+        # near-identical messages every hour, which read as spam.
+        city_hits: Dict[str, Dict[str, Dict[str, Any]]] = {}
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_task = {
@@ -404,28 +405,21 @@ def run_checker_loop(config_path: str, run_once: bool = False):
                     logger.error(f"Check failed for {product_url} @ {pincode}: {e}")
                     continue
 
-                title = title or product_titles.get(product_url)
-                state_key = (product_url, pincode)
-                last_notified = notified_state.get(state_key, 0)
+                title = title or product_titles.get(product_url) or "Croma Product"
 
                 if in_stock:
-                    logger.info(f"✅ IN STOCK! Product: {title or product_url} | Pincode: {pincode} | Price: {price}")
-
-                    if (time.time() - last_notified) > cooldown_seconds:
-                        alert_msg = format_stock_alert(
-                            product_title=title or "Croma Product",
-                            product_url=product_url,
-                            pincode=pincode,
-                            price=price,
-                            delivery_info=delivery_info
-                        )
-                        sent_tg = send_telegram_message(bot_token, chat_id, alert_msg)
-                        if sent_tg:
-                            notified_state[state_key] = time.time()
-                    else:
-                        logger.info(f"Skipping alert for {state_key} (cooldown active).")
+                    logger.info(f"✅ IN STOCK! Product: {title} | Pincode: {pincode} | Price: {price}")
+                    city = get_city_name(pincode)
+                    product_entry = city_hits.setdefault(city, {}).setdefault(title, {"pins": [], "url": product_url})
+                    product_entry["pins"].append(pincode)
                 else:
                     logger.info(f"❌ OUT OF STOCK / Unavailable for product {product_url} at pincode {pincode}. Reason: {delivery_info}")
+
+        if city_hits:
+            alert_msg = format_grouped_stock_alert(city_hits)
+            send_telegram_message(bot_token, chat_id, alert_msg)
+        else:
+            logger.info("No stock found this pass; no alert sent.")
 
         if run_once:
             logger.info("Single pass complete (--once flag passed). Exiting.")

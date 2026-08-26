@@ -389,7 +389,6 @@
   ],
   "settings": {
     "check_interval_seconds": 7200,
-    "notify_cooldown_minutes": 60,
     "use_playwright_fallback": true,
     "max_concurrent_checks": 8
   }
